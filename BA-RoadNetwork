@@ -1,0 +1,2610 @@
+--
+-- PostgreSQL database dump
+--
+
+-- Dumped from database version 14.6 (Ubuntu 14.6-0ubuntu0.22.04.1)
+-- Dumped by pg_dump version 14.6 (Ubuntu 14.6-0ubuntu0.22.04.1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: plpython3u; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS plpython3u WITH SCHEMA pg_catalog;
+
+
+--
+-- Name: EXTENSION plpython3u; Type: COMMENT; Schema: -; Owner: 
+--
+
+COMMENT ON EXTENSION plpython3u IS 'PL/Python3U untrusted procedural language';
+
+
+--
+-- Name: shortest_path; Type: TYPE; Schema: public; Owner: postgres
+--
+
+CREATE TYPE public.shortest_path AS (
+	path bigint[],
+	arrival_time time without time zone
+);
+
+
+ALTER TYPE public.shortest_path OWNER TO postgres;
+
+--
+-- Name: calc_alpha(double precision, integer); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.calc_alpha(lanes double precision, cars integer) RETURNS double precision
+    LANGUAGE plpython3u
+    AS $$
+import random
+if 1 <= lanes < 2: 
+    if cars <= 5: 
+        value = random.uniform(0.7,0.9)
+    elif 5<cars<=10:
+        value = random.uniform(0.5,0.7)
+    elif 10<cars<=20:
+        value = random.uniform(0.4,0.5)
+    else:
+        value = random.uniform(0.3,0.4)
+
+elif 2 <= lanes <= 3:
+    if cars <= 5: 
+        value = random.uniform(0.8,0.95)
+    elif 5<cars<=10:
+        value = random.uniform(0.6,0.8)
+    elif 10<cars<=15:
+        value = random.uniform(0.5,0.6)
+    else:
+        value = random.uniform(0.4,0.5)
+
+elif lanes > 3:
+    if cars <= 5: 
+        value = random.uniform(0.9,1.0)
+    elif 5<cars<=10:
+        value = random.uniform(0.7,0.9)
+    elif 10<cars<=15:
+        value = random.uniform(0.6,0.7)
+    else:
+        value = random.uniform(0.5,0.6)
+
+return value
+$$;
+
+
+ALTER FUNCTION public.calc_alpha(lanes double precision, cars integer) OWNER TO postgres;
+
+--
+-- Name: calc_delta(boolean); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.calc_delta(traffic_light boolean) RETURNS double precision
+    LANGUAGE plpython3u
+    AS $$
+if traffic_light:
+    return 15
+return 0
+$$;
+
+
+ALTER FUNCTION public.calc_delta(traffic_light boolean) OWNER TO postgres;
+
+--
+-- Name: dynamic_shortest_path(bigint, bigint, time without time zone); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.dynamic_shortest_path(s bigint, t bigint, t0 time without time zone) RETURNS public.shortest_path
+    LANGUAGE plpython3u
+    AS $_$
+import datetime
+from datetime import date
+import math
+t_0 = datetime.time(*map(int, t0.split(':')))
+t_0 = datetime.datetime.combine(date.today(), t_0)
+ps = plpy.prepare("SELECT Laengengrad, Breitengrad FROM Knoten WHERE ID = $1", ["bigint"])
+rv = ps.execute([t])
+target_coordinates = [rv[0]["breitengrad"], rv[0]["laengengrad"]]
+rv = plpy.execute("SELECT ID FROM Knoten")
+nodes = []
+for i in range(len(rv)):
+    nodes.append(rv[i]["id"])
+vor = {}
+d = {}
+for node in nodes:
+    d[node] = math.inf
+d[s] = t_0
+vor[s] = -1
+Q = [node for node in nodes]
+while Q:
+    u = Q[0]
+    for node in Q:
+        if d[node] == math.inf:
+            continue
+        if d[u] == math.inf:
+            u = node
+            continue
+
+        #d_u = datetime.datetime.combine(date.today(), d[u])
+        h_u = plpy.prepare("SELECT heuristics($1, $2)", ["bigint", "float[]"]).execute([u, target_coordinates])[0]["heuristics"]
+        h_u = datetime.timedelta(h_u)
+        #d_node = datetime.datetime.combine(date.today(), d[node])
+        h_node = plpy.prepare("SELECT heuristics($1, $2)", ["bigint", "float[]"]).execute([node, target_coordinates])[0]["heuristics"]
+        h_node = datetime.timedelta(h_node)
+        if d[node] + h_node < d[u] + h_u:
+            u = node
+    Q.remove(u)
+    if u == t:
+    	break
+    ps = plpy.prepare("SELECT neighbours($1)", ["bigint"])
+    ne_u = []
+    rv = ps.execute([u])[0]["neighbours"]
+    for node in rv:
+        ne_u.append(node)
+    for v in ne_u:
+        if v in Q:  
+            ps = plpy.prepare("SELECT ID FROM Kante WHERE Knoten1_ID = $1 and Knoten2_ID = $2", ["bigint", "bigint"])
+            e = ps.execute([u, v])[0]["id"]
+            ps = plpy.prepare("SELECT weight($1, $2)", ["integer", "time"])
+            w = ps.execute([e, d[u].time()])[0]["weight"]
+            if w == math.inf:
+                continue
+            weight = datetime.timedelta(seconds=w)
+
+            if d[v] == math.inf:
+                d[v] = (d[u] + weight)
+                vor[v] = u
+                continue
+
+            if (d[u] + weight) < d[v]:
+                d[v] = (d[u] + weight)
+                vor[v] = u
+path = [t]
+i = t
+while vor[i] != -1:
+    path.append(vor[i])
+    i = vor[i]
+path.reverse()
+arrival_time = d[t]
+return [path, arrival_time.time()]
+$_$;
+
+
+ALTER FUNCTION public.dynamic_shortest_path(s bigint, t bigint, t0 time without time zone) OWNER TO postgres;
+
+--
+-- Name: heuristics(bigint, double precision[]); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.heuristics(node_id bigint, target_coordinates double precision[]) RETURNS double precision
+    LANGUAGE plpython3u
+    AS $_$
+from math import radians, cos, sin, asin, sqrt
+
+query = """
+	SELECT Laengengrad, Breitengrad
+	FROM Knoten
+	WHERE ID = $1
+	
+"""
+
+ps = plpy.prepare(query, ["bigint"])
+
+rv = ps.execute([node_id])
+
+lon1 = rv[0]["laengengrad"]
+lat1 = rv[0]["breitengrad"]
+
+lat2, lon2 = target_coordinates
+
+lon1 = radians(lon1)
+lon2 = radians(lon2)
+lat1 = radians(lat1)
+lat2 = radians(lat2)
+
+dlon = lon2 - lon1
+dlat = lat2 - lat1
+
+a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+
+c = 2 * asin(sqrt(a))
+
+r = 6371000
+
+distance = c * r
+
+return distance / (50 / (18/5))
+$_$;
+
+
+ALTER FUNCTION public.heuristics(node_id bigint, target_coordinates double precision[]) OWNER TO postgres;
+
+--
+-- Name: neighbours(bigint); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.neighbours(node_id bigint) RETURNS bigint[]
+    LANGUAGE plpython3u
+    AS $_$
+
+query = """
+	SELECT Knoten2_ID
+	FROM Kante
+	WHERE Knoten1_ID = $1
+	
+"""
+
+ps = plpy.prepare(query, ["bigint"])
+
+rv = ps.execute([node_id])
+
+neighbour_nodes = []
+for i in range(len(rv)):
+	neighbour_nodes.append(rv[i]["knoten2_id"])
+
+return neighbour_nodes
+$_$;
+
+
+ALTER FUNCTION public.neighbours(node_id bigint) OWNER TO postgres;
+
+--
+-- Name: number_of_cars(double precision); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.number_of_cars(length double precision) RETURNS integer
+    LANGUAGE plpython3u
+    AS $$
+import random
+if length<=50:
+    cars = 0
+elif 50<length<=200.0:
+    cars = random.randint(0,10)
+elif 200<length<=500.0:
+    cars = random.randint(0,20)
+else:
+    cars = random.randint(0,30)
+    
+return cars
+$$;
+
+
+ALTER FUNCTION public.number_of_cars(length double precision) OWNER TO postgres;
+
+--
+-- Name: time_test(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.time_test() RETURNS time without time zone
+    LANGUAGE plpython3u
+    AS $$
+import datetime
+return datetime.datetime.now().time()
+$$;
+
+
+ALTER FUNCTION public.time_test() OWNER TO postgres;
+
+--
+-- Name: weight(integer, time without time zone); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.weight(edge_id integer, t time without time zone) RETURNS double precision
+    LANGUAGE plpython3u
+    AS $_$
+import math
+
+query = """
+SELECT IstGesperrt, Laenge, Geschwindigkeitsbeschraenkung, AnzahlFahrspuren, AmpelVorhanden
+FROM Kante, Kanteneigenschaften, Zeitintervall
+WHERE
+Startzeitpunkt <= $1 and Endzeitpunkt >= $2 and
+Kante.ID = $3 and
+Zeitintervall_ID = Zeitintervall.ID and
+Kante.ID = Kanteneigenschaften.Kanten_ID
+"""
+
+plan = plpy.prepare(query, ["time", "time", "integer"])
+
+rv = plan.execute([t, t, edge_id])
+
+road_blocked = rv[0]["istgesperrt"] 
+length = rv[0]["laenge"]
+max_speed = rv[0]["geschwindigkeitsbeschraenkung"]
+lanes = rv[0]["anzahlfahrspuren"]
+traffic_light = rv[0]["ampelvorhanden"]
+
+if road_blocked:
+    return math.inf
+
+cars = plpy.prepare("SELECT number_of_cars($1)", ["float"]).execute([length])[0]["number_of_cars"]
+alpha = plpy.prepare("SELECT calc_alpha($1, $2)", ["float", "integer"]).execute([length, cars])[0]["calc_alpha"]
+delta = plpy.prepare("SELECT calc_delta($1)", ["boolean"]).execute([traffic_light])[0]["calc_delta"]
+
+weight = plpy.prepare("SELECT weight_function($1, $2, $3, $4)", ["float", "float", "float", "float"]).execute([length, alpha, max_speed, delta])[0]["weight_function"]
+return weight
+$_$;
+
+
+ALTER FUNCTION public.weight(edge_id integer, t time without time zone) OWNER TO postgres;
+
+--
+-- Name: weight_function(double precision, double precision, double precision, double precision); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.weight_function(length double precision, alpha double precision, max_speed double precision, delta double precision) RETURNS double precision
+    LANGUAGE plpython3u
+    AS $$
+weight = (length/max_speed) * (1/alpha) * (18/5) + delta
+return weight
+$$;
+
+
+ALTER FUNCTION public.weight_function(length double precision, alpha double precision, max_speed double precision, delta double precision) OWNER TO postgres;
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: kante; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.kante (
+    id integer NOT NULL,
+    knoten1_id bigint,
+    knoten2_id bigint,
+    laenge double precision,
+    art character varying(50),
+    name character varying(100),
+    ampelvorhanden boolean
+);
+
+
+ALTER TABLE public.kante OWNER TO postgres;
+
+--
+-- Name: kante_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.kante_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.kante_id_seq OWNER TO postgres;
+
+--
+-- Name: kante_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.kante_id_seq OWNED BY public.kante.id;
+
+
+--
+-- Name: kanteneigenschaften; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.kanteneigenschaften (
+    kanten_id integer,
+    zeitintervall_id integer,
+    geschwindigkeitsbeschraenkung double precision,
+    anzahlfahrspuren double precision,
+    istgesperrt boolean
+);
+
+
+ALTER TABLE public.kanteneigenschaften OWNER TO postgres;
+
+--
+-- Name: knoten; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.knoten (
+    id bigint NOT NULL,
+    laengengrad double precision,
+    breitengrad double precision
+);
+
+
+ALTER TABLE public.knoten OWNER TO postgres;
+
+--
+-- Name: zeitintervall; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.zeitintervall (
+    id integer NOT NULL,
+    startzeitpunkt time without time zone,
+    endzeitpunkt time without time zone
+);
+
+
+ALTER TABLE public.zeitintervall OWNER TO postgres;
+
+--
+-- Name: zeitintervall_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.zeitintervall_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.zeitintervall_id_seq OWNER TO postgres;
+
+--
+-- Name: zeitintervall_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.zeitintervall_id_seq OWNED BY public.zeitintervall.id;
+
+
+--
+-- Name: kante id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.kante ALTER COLUMN id SET DEFAULT nextval('public.kante_id_seq'::regclass);
+
+
+--
+-- Name: zeitintervall id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.zeitintervall ALTER COLUMN id SET DEFAULT nextval('public.zeitintervall_id_seq'::regclass);
+
+
+--
+-- Data for Name: kante; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.kante (id, knoten1_id, knoten2_id, laenge, art, name, ampelvorhanden) FROM stdin;
+1	9665706	321767571	262.771	secondary	Südring	f
+2	9665706	250137189	77.554	secondary	Südring	t
+3	321767571	9665706	262.771	secondary	Südring	f
+4	321767571	1256608721	59.75999999999999	secondary	Südring	t
+5	250137189	250137191	16.707	secondary	Südring	f
+6	250137189	31237045	288.806	primary	Südring	t
+7	250137189	246728740	32.548	residential	Südring	t
+8	10011512	1359747808	77.034	tertiary	Erich-Schlesinger-Straße	t
+9	10011512	3967783745	269.023	tertiary	Erich-Schlesinger-Straße	t
+10	10011512	73847607	198.24	residential	Rudolf-Diesel-Straße	f
+11	1359747808	2696344694	11.733	tertiary	Erich-Schlesinger-Straße	f
+12	1359747808	10011512	77.03399999999999	tertiary	Erich-Schlesinger-Straße	t
+13	3967783745	4163394505	17.591	tertiary		f
+14	3967783745	10011512	269.023	tertiary	Erich-Schlesinger-Straße	t
+15	73847607	10011512	198.24	residential	Rudolf-Diesel-Straße	f
+16	73847607	10712410	81.449	residential	Joachim-Jungius-Straße	f
+17	73847607	10712394	174.689	residential	Joachim-Jungius-Straße	f
+18	10011513	10011514	23.447000000000003	primary	Erich-Schlesinger-Straße	f
+19	10011513	257395464	507.10599999999994	primary	Südring	t
+20	10011513	2696344694	165.55800000000002	tertiary	Erich-Schlesinger-Straße	t
+21	10011514	10011513	23.447000000000003	primary	Erich-Schlesinger-Straße	f
+22	10011514	247804976	139.80900000000003	residential	Erich-Schlesinger-Straße	t
+23	10011514	247740090	430.74199999999996	primary	Südring	t
+24	257395464	1256628082	38.428	primary	Südring	f
+25	257395464	1530756101	31.169999999999998	primary	Südring	f
+26	2696344694	1359747808	11.733	tertiary	Erich-Schlesinger-Straße	f
+27	2696344694	10011513	165.55800000000002	tertiary	Erich-Schlesinger-Straße	t
+28	2696344694	2696344695	35.869	residential	Pütterweg	f
+29	247804976	247805020	168.59799999999998	residential	Erich-Schlesinger-Straße	f
+30	247804976	10011514	139.809	residential	Erich-Schlesinger-Straße	t
+31	247804976	28324254	123.79299999999999	residential	Ziolkowskistraße	f
+32	247740090	28324298	11.388	primary	Südring	f
+33	247740090	247740093	274.77200000000005	residential	Platz der Freundschaft	t
+34	10712392	10712398	154.173	residential	Joachim-Jungius-Straße	f
+35	10712392	74170798	81.506	residential	Joachim-Jungius-Straße	f
+36	10712392	2486874178	477.68399999999997	residential	Max-Planck-Straße	f
+37	10712398	658555668	153.00300000000001	residential	Albert-Einstein-Straße	f
+38	10712398	249494114	82.888	residential	Albert-Einstein-Straße	f
+39	10712398	84497187	473.66700000000003	residential	Albert-Einstein-Straße	f
+40	10712398	10712392	154.173	residential	Joachim-Jungius-Straße	f
+41	74170798	10712392	81.506	residential	Joachim-Jungius-Straße	f
+42	74170798	10712410	79.74	residential	Joachim-Jungius-Straße	f
+43	74170798	10712405	439.192	residential	Max-von-Laue-Straße	f
+44	2486874178	10712405	115.896	residential	Brahestraße	f
+45	2486874178	10712392	477.68399999999997	residential	Max-Planck-Straße	f
+46	2486874178	31237041	112.281	residential	Max-Planck-Straße	t
+47	10712394	73847607	174.68900000000002	residential	Joachim-Jungius-Straße	f
+48	10712394	2100157286	483.815	residential	Brahestraße	f
+49	10712394	1658759564	86.72200000000001	residential	Brahestraße	f
+50	2100157286	10712410	367.77599999999995	residential	Joseph-Herzfeld-Straße	f
+51	2100157286	10712405	176.743	residential	Brahestraße	f
+52	2100157286	10712394	483.815	residential	Brahestraße	f
+53	1658759564	10712394	86.72200000000001	residential	Brahestraße	f
+54	658555668	10712398	153.00300000000001	residential	Albert-Einstein-Straße	f
+55	658555668	4163394504	19.474	residential		t
+56	249494114	1131561396	95.142	living_street	Albert-Einstein-Straße	f
+57	249494114	10712398	82.888	residential	Albert-Einstein-Straße	f
+58	249494114	1131561496	49.974999999999994	unclassified	Albert-Einstein-Straße	f
+59	84497187	10712398	473.66700000000003	residential	Albert-Einstein-Straße	f
+60	84497187	4721819251	49.308	residential	Albert-Einstein-Straße	f
+61	84497187	201251898	165.391	residential	Albert-Einstein-Straße	f
+62	10712401	10712402	23.289	primary	Südring	f
+63	10712401	1256628061	308.512	primary	Südring	t
+64	10712402	10712401	23.289	primary	Südring	f
+65	10712402	31237041	308.80799999999994	primary	Südring	t
+66	1256628061	250881130	9.158000000000001	primary	Südring	f
+67	31237041	31237045	21.227999999999998	primary	Südring	f
+68	31237041	250137191	287.611	primary	Südring	t
+69	31237041	2486874178	112.281	residential	Max-Planck-Straße	t
+70	10712405	2486874178	115.89599999999999	residential	Brahestraße	f
+71	10712405	2100157286	176.743	residential	Brahestraße	f
+72	10712410	74170798	79.74	residential	Joachim-Jungius-Straße	f
+73	10712410	73847607	81.44900000000001	residential	Joachim-Jungius-Straße	f
+74	25475250	31338252	28.648	secondary	Parkstraße	f
+75	25475250	7627004851	68.162	secondary	Parkstraße	f
+76	31338252	25475250	28.648	secondary	Parkstraße	f
+77	31338252	31198364	116.86200000000001	residential	Graf-Lippe-Straße	f
+78	31338252	31237039	250.28699999999998	secondary	Parkstraße	f
+79	7627004851	7943127774	38.09	secondary	Parkstraße	f
+80	7627004851	25475250	68.162	secondary	Parkstraße	f
+81	27627986	27627988	149.121	residential	Felix-Stillfried-Straße	f
+82	27627986	27627989	68.243	residential	Eggersstraße	f
+83	27627986	246728636	83.751	residential	Eggersstraße	f
+84	27627988	27627986	149.121	residential	Felix-Stillfried-Straße	f
+85	27627988	27628018	68.506	residential	Oldendorpstraße	f
+86	27627988	27628012	66.755	residential	Oldendorpstraße	f
+87	27627989	29272478	67.321	residential	Liskowstraße	f
+88	27627989	27627990	68.497	residential	Liskowstraße	f
+89	27627989	27627986	68.243	residential	Eggersstraße	f
+90	246728636	29272466	22.286	residential	Eggersstraße	f
+91	246728636	246728635	84.918	living_street	Tremsenplatz	f
+92	246728636	27627986	83.751	residential	Eggersstraße	f
+93	27628018	29272478	78.802	residential	Liskowstraße	f
+94	27628018	27719460	134.34699999999998	residential	Oldendorpstraße	f
+95	27628018	27627988	68.506	residential	Oldendorpstraße	f
+96	27628018	3147039055	132.44600000000003	residential	Liskowstraße	f
+97	27628012	27627988	66.755	residential	Oldendorpstraße	f
+98	27628012	29272466	177.367	residential	Voßstraße	f
+99	27628012	27628013	149.91500000000002	residential	Voßstraße, Bei der Tweel	f
+100	29272478	27627989	67.321	residential	Liskowstraße	f
+101	29272478	27628018	78.802	residential	Liskowstraße	f
+102	29272478	29272477	61.649	residential	Joachim-Schlue-Straße	f
+103	27627990	27627993	68.499	residential	Liskowstraße	f
+104	27627990	27627989	68.497	residential	Liskowstraße	f
+105	27627990	29272469	156.112	residential	Trojanstraße	f
+106	27627993	31237039	78.033	residential	Liskowstraße	f
+107	27627993	27627990	68.499	residential	Liskowstraße	f
+108	27627993	29272475	127.744	residential	Schliemannstraße	f
+109	27627993	29272485	137.814	residential	Schliemannstraße	f
+110	29272469	27627990	156.112	residential	Trojanstraße	f
+111	29272469	29272485	94.795	residential	Seidelstraße	f
+112	29272469	246728635	56.24399999999999	residential	Seidelstraße	f
+113	31237039	27627993	78.033	residential	Liskowstraße	f
+114	31237039	31338252	250.28699999999998	secondary	Parkstraße	f
+115	29272475	29272477	116.26599999999999	residential	Peter-Kalff-Straße	f
+116	29272475	27627993	127.744	residential	Schliemannstraße	f
+117	29272485	29272469	94.795	residential	Seidelstraße	f
+118	29272485	27627993	137.814	residential	Schliemannstraße	f
+119	29272485	29272486	156.994	residential	Schliemannstraße	f
+120	29272466	246728636	22.286	residential	Eggersstraße	f
+121	29272466	29272467	84.508	residential	Voßstraße	f
+122	29272466	27628012	177.36700000000002	residential	Voßstraße	f
+123	27628013	27628012	149.91500000000002	residential	Voßstraße, Bei der Tweel	f
+124	27628013	27719467	34.004	residential	Bei der Tweel	t
+125	27628013	3147039055	38.524	residential	Bei der Tweel	f
+126	27719467	31237030	166.287	tertiary	Erich-Schlesinger-Straße	t
+127	27719467	27628013	34.004	residential	Bei der Tweel	t
+128	27719467	243689105	21.883000000000003	residential	Bei der Tweel	t
+129	3147039055	27719460	212.067	residential	Laurembergstraße, Bei der Tweel	f
+130	3147039055	27628013	38.524	residential	Bei der Tweel	f
+131	3147039055	27628018	132.446	residential	Liskowstraße	f
+132	27719460	27628018	134.34699999999998	residential	Oldendorpstraße	f
+133	27719460	3147039055	212.067	residential	Laurembergstraße, Bei der Tweel	f
+134	31237030	5057720699	51.813	tertiary	Erich-Schlesinger-Straße	f
+135	31237030	27719467	166.287	tertiary	Erich-Schlesinger-Straße	t
+136	31237030	268379002	342.155	residential	Elisabeth-Schnitzler-Straße	f
+137	243689105	27719467	21.883000000000003	residential	Bei der Tweel	t
+138	243689105	243689107	124.376	residential	Engelstraße	f
+139	243689105	243689108	221.63000000000002	residential	Bei der Tweel, Babststraße	f
+140	28324254	269978619	183.04	residential	Mendelejewstraße	f
+141	28324254	247804976	123.793	residential	Ziolkowskistraße	f
+142	28324254	74190354	214.48700000000008	residential	Ziolkowskistraße	f
+143	269978619	269978621	12.677	residential	Mendelejewstraße	f
+144	269978619	269978616	146.885	residential	Mendelejewstraße	f
+145	269978619	28324254	183.04	residential	Mendelejewstraße	f
+146	74190354	28324254	214.48700000000002	residential	Ziolkowskistraße	f
+147	74190354	74190368	203.759	residential	Kurt-Tucholsky-Straße	f
+148	28324298	2696108465	26.825	residential	Platz der Freundschaft	f
+149	28324298	761253990	243.60000000000002	primary	Südring	f
+150	2696108465	10011513	439.768	primary	Südring	t
+151	2696108465	247740090	28.122999999999998	residential	Platz der Freundschaft	f
+152	2696108465	343733974	366.0450000000001	primary	Goetheplatz, Südring	t
+153	761253990	343733999	79.88499999999999	primary	Südring	f
+154	29272467	29272466	84.508	residential	Voßstraße	f
+155	29272467	2528028823	294.065	residential	Voßstraße	f
+156	29272467	246728635	22.027	residential	Seidelstraße	f
+157	2528028823	7627004834	15.597	residential	Voßstraße	f
+158	2528028823	29272467	294.065	residential	Voßstraße	f
+159	246728635	246728636	84.918	living_street	Tremsenplatz	f
+160	246728635	29272469	56.244	residential	Seidelstraße	f
+161	246728635	29272467	22.027	residential	Seidelstraße	f
+162	29272477	29272478	61.648999999999994	residential	Joachim-Schlue-Straße	f
+163	29272477	29272475	116.266	residential	Peter-Kalff-Straße	f
+164	29272486	29272485	156.99399999999997	residential	Schliemannstraße	f
+165	31198364	31338252	116.862	residential	Graf-Lippe-Straße	f
+166	5057720699	31237030	51.813	tertiary	Erich-Schlesinger-Straße	f
+167	5057720699	4163394515	18.521	tertiary		t
+168	268379002	31237030	342.15500000000003	residential	Elisabeth-Schnitzler-Straße	f
+169	31237045	31237041	21.228	primary	Südring	f
+170	31237045	10712401	314.786	primary	Südring	t
+171	250137191	250137189	16.707	secondary	Südring	f
+172	250137191	9665706	75.714	secondary	Südring	f
+173	250137191	4721819251	180.24099999999999	residential	Albert-Einstein-Straße	t
+174	74170783	1131561496	75.961	unclassified	Albert-Einstein-Straße	f
+175	1131561496	1131561521	103.054	unclassified	Albert-Einstein-Straße	f
+176	1131561496	249494114	49.974999999999994	unclassified	Albert-Einstein-Straße	f
+177	1131561496	74170783	75.961	unclassified	Albert-Einstein-Straße	f
+178	74190368	74190368	342.721	residential	Kurt-Tucholsky-Straße	f
+179	74190368	74190368	342.72099999999995	residential	Kurt-Tucholsky-Straße	f
+180	74190368	74190354	203.75900000000001	residential	Kurt-Tucholsky-Straße	f
+181	4721819251	258925449	180.848	residential	Albert-Einstein-Straße	f
+182	4721819251	84497187	49.30800000000001	residential	Albert-Einstein-Straße	f
+183	4721819251	250137191	180.24099999999999	residential	Albert-Einstein-Straße	t
+184	201251898	1131561521	392.561	residential	Albert-Einstein-Straße	f
+185	201251898	258925449	138.04200000000003	residential	Albert-Einstein-Straße	f
+186	201251898	84497187	165.39100000000002	residential	Albert-Einstein-Straße	f
+187	103778766	2715807968	12.44	primary	Goetheplatz	f
+188	103778766	343733997	57.482	tertiary	Goetheplatz	f
+189	2715807968	2708527973	7.982	primary_link	Goetheplatz	f
+190	2715807968	1769584554	82.79	tertiary	Goetheplatz	t
+191	343733997	1769584554	16.572	tertiary	Goetheplatz	f
+192	1131561521	201251898	392.56100000000004	residential	Albert-Einstein-Straße	f
+193	1131561521	1131561396	73.665	living_street		f
+194	1131561521	1131561496	103.054	unclassified	Albert-Einstein-Straße	f
+195	258925449	4721819251	180.84800000000004	residential	Albert-Einstein-Straße	f
+196	258925449	201251898	138.042	residential	Albert-Einstein-Straße	f
+197	258925449	277674651	52.766	residential	Albert-Einstein-Straße	f
+198	201251911	277674651	20.29	residential	Albert-Einstein-Straße	f
+199	201251911	250137203	129.063	residential	Albert-Einstein-Straße	f
+200	201251911	201251917	105.461	residential	Albert-Einstein-Straße	f
+201	277674651	201251911	20.29	residential	Albert-Einstein-Straße	f
+202	277674651	277674652	14.883	living_street	Albert-Einstein-Straße	f
+203	277674651	258925449	52.76599999999999	residential	Albert-Einstein-Straße	f
+204	250137203	201251911	129.063	residential	Albert-Einstein-Straße	f
+205	201251917	201251911	105.46100000000001	residential	Albert-Einstein-Straße	f
+206	243689107	243689108	11.116	residential	Babststraße	f
+207	243689107	243689108	86.194	residential	Kosegartenstraße	f
+208	243689107	243689105	124.376	residential	Engelstraße	f
+209	243689108	243689107	11.116	residential	Babststraße	f
+210	243689108	243689107	86.194	residential	Kosegartenstraße	f
+211	243689108	243689105	221.63	residential	Bei der Tweel, Babststraße	f
+212	246728722	246728740	40.356	residential	Südring	f
+213	246728740	2089344721	250.29900000000004	residential	Südring	f
+214	246728740	250137189	32.548	residential	Südring	t
+215	246728740	246728722	40.356	residential	Südring	f
+216	2089344721	2089344721	117.12899999999999	residential	Südring	f
+217	2089344721	2089344721	117.129	residential	Südring	f
+218	2089344721	246728740	250.29900000000004	residential	Südring	f
+219	247740093	247740097	22.781	residential	Platz der Freundschaft	f
+220	247805020	247804976	168.59799999999998	residential	Erich-Schlesinger-Straße	f
+221	247805020	247805024	162.17100000000002	residential	Erich-Schlesinger-Straße	f
+222	247805024	247805024	62.725	residential	Erich-Schlesinger-Straße	f
+223	247805024	247805024	62.724999999999994	residential	Erich-Schlesinger-Straße	f
+224	247805024	247805020	162.171	residential	Erich-Schlesinger-Straße	f
+225	1131561396	1654329582	63.949999999999996	living_street		f
+226	1131561396	1131561521	73.665	living_street		f
+227	1131561396	249494114	95.14199999999998	living_street	Albert-Einstein-Straße	f
+228	250881130	1530756101	9.046	primary	Südring	f
+229	250881130	10011514	551.6809999999999	primary	Südring	t
+230	1530756101	1256628061	10.148	primary	Südring	f
+231	1530756101	1256628082	19.391000000000002	primary	Südring	f
+232	1256628082	10712402	295.068	primary	Südring	t
+233	269978616	269978619	146.885	residential	Mendelejewstraße	f
+234	269978621	269978619	12.677	residential	Mendelejewstraße	f
+235	277674652	277674651	14.883	living_street	Albert-Einstein-Straße	f
+236	277674652	2094649467	127.10700000000001	living_street	Albert-Einstein-Straße	f
+237	277674652	277674654	91.945	living_street	Albert-Einstein-Straße	f
+238	2094649467	277674652	127.107	living_street	Albert-Einstein-Straße	f
+239	277674654	277674652	91.94500000000002	living_street	Albert-Einstein-Straße	f
+240	1256608721	2271591606	38.434000000000005	secondary	Satower Straße	f
+241	1256608721	2710776228	7.456	secondary	Südring	f
+242	343733974	2696108465	366.0450000000001	primary	Goetheplatz, Südring	t
+243	343733974	2708527973	18.685000000000002	primary_link	Goetheplatz	f
+244	2708527973	2715807968	7.982	primary_link	Goetheplatz	f
+245	2708527973	103778766	11.46	primary_link	Goetheplatz	f
+246	2708527973	343733974	18.685000000000002	primary_link	Goetheplatz	f
+247	1769584554	2715807968	82.79	tertiary	Goetheplatz	t
+248	343733999	343733997	57.67	tertiary	Goetheplatz	f
+249	343733999	103778766	49.525999999999996	primary	Goetheplatz	t
+250	343733999	761253990	79.885	primary	Südring	f
+251	388634928	509256471	17.672	living_street	Satower Straße	f
+252	388634928	2094649490	47.795	living_street	Satower Straße	f
+253	388634928	2488728240	27.226999999999997	living_street	Satower Straße	f
+254	509256471	388634928	17.672	living_street	Satower Straße	f
+255	509256471	388634935	66.96000000000001	living_street	Satower Straße	f
+256	509256471	2488728240	38.045	living_street	Satower Straße	f
+257	2094649490	388634928	47.795	living_street	Satower Straße	f
+258	2488728240	509256471	38.045	living_street	Satower Straße	f
+259	2488728240	388634928	27.226999999999997	living_street	Satower Straße	f
+260	2488728240	388634940	17.901	living_street	Satower Straße	f
+261	388634935	509256471	66.96000000000001	living_street	Satower Straße	f
+262	388634940	2271591606	24.053	secondary	Satower Straße	f
+263	388634940	7955665371	109.50200000000001	secondary	Satower Straße	f
+264	388634940	2488728240	17.901	living_street	Satower Straße	f
+265	2271591606	388634940	24.053	secondary	Satower Straße	f
+266	2271591606	2710776228	41.819	secondary	Satower Straße	t
+267	7955665371	388634940	109.50200000000001	secondary	Satower Straße	f
+268	7955665371	7925442608	47.464	secondary	Satower Straße	f
+269	7955665371	7925442607	592.5010000000001	residential	Kobertstraße, Thierfelderstraße	f
+270	4163394504	4163394499	16.191	tertiary		f
+271	1654329582	1131561396	63.949999999999996	living_street		f
+272	2710776228	1256608723	10.844	secondary	Südring	f
+273	2710776228	1256608731	33.678000000000004	secondary	Satower Straße	f
+274	1256608723	321767571	57.97	secondary	Südring	f
+275	1256608723	1256608721	11.499	secondary	Satower Straße	f
+276	1256608731	1256608723	28.73	secondary	Satower Straße	t
+277	1359747810	1359747818	15.219000000000001	residential	Pütterweg	f
+278	1359747810	2696344695	128.147	residential	Pütterweg	f
+279	1359747818	10580114989	74.57300000000001	residential	Pütterweg	f
+280	1359747818	1359747810	33.75500000000001	residential	Pütterweg	f
+281	2696344695	1359747810	128.14700000000002	residential	Pütterweg	f
+282	2696344695	1359747808	35.932	residential	Pütterweg	f
+283	10580114989	1359747818	74.573	residential	Pütterweg	f
+284	7627004834	7627004845	10.411	secondary	Parkstraße	f
+285	2696093303	28324298	278.443	residential	Platz der Freundschaft	t
+286	2696093303	247740093	23.58	residential	Platz der Freundschaft	f
+287	4163394505	4163394519	37.627	tertiary		f
+288	4163394499	3967783745	17.564	tertiary		f
+289	4163394499	4163394505	8.867	tertiary		f
+290	4163394519	5057720699	18.5	tertiary		f
+291	4163394519	4163394515	8.291	tertiary		f
+292	4163394508	658555668	20.201	residential		f
+293	4163394508	4163394504	10.086	tertiary		f
+294	4163394515	4163394508	13.905	tertiary		f
+295	7042160246	7925442607	39.51	residential	Thierfelderstraße	f
+296	7042160246	7627004839	20.364	residential	Thierfelderstraße	f
+297	7925442607	7627004851	63.133	residential	Thierfelderstraße	f
+298	7925442607	7042160246	39.510000000000005	residential	Thierfelderstraße	f
+299	7925442607	7955665371	592.5009999999999	residential	Kobertstraße, Thierfelderstraße	f
+300	7627004839	7943127773	5.272	secondary	Satower Straße	f
+301	7627004845	7943127774	19.854	secondary	Parkstraße	f
+302	7627004845	7627004844	8.549	secondary	Parkstraße	f
+303	7627004836	7946056891	11.862	secondary	Satower Straße	f
+304	7946056891	7627004834	6.751	secondary	Satower Straße	f
+305	7946056891	2528028823	17.156	residential	Voßstraße	f
+306	7943127773	7925442608	17.885	secondary	Satower Straße	f
+307	7943127773	7627004836	10.095	secondary	Satower Straße	f
+308	7627004840	7042160246	16.114	residential	Thierfelderstraße	f
+309	7627004840	7627004839	8.716999999999999	secondary	Satower Straße	f
+310	7627004844	7627004840	12.31	secondary	Parkstraße	f
+311	7943127774	7627004851	38.09	secondary	Parkstraße	f
+312	7943127774	7627004844	19.305	secondary	Parkstraße	f
+313	7925442608	7955665371	47.464	secondary	Satower Straße	f
+314	7925442608	7627004836	19.340000000000003	secondary	Satower Straße	f
+\.
+
+
+--
+-- Data for Name: kanteneigenschaften; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.kanteneigenschaften (kanten_id, zeitintervall_id, geschwindigkeitsbeschraenkung, anzahlfahrspuren, istgesperrt) FROM stdin;
+1	1	50	2	f
+1	2	50	2	f
+1	3	50	2	f
+1	4	50	2	f
+1	5	50	2	f
+2	1	50	2	f
+2	2	50	2	f
+2	3	50	2	f
+2	4	50	2	f
+2	5	50	2	f
+3	1	50	2	f
+3	2	50	2	f
+3	3	50	2	f
+3	4	50	2	f
+3	5	50	2	f
+4	1	50	1	f
+4	2	50	1	f
+4	3	50	1	f
+4	4	50	1	f
+4	5	50	1	f
+5	1	50	1	f
+5	2	50	1	f
+5	3	50	1	f
+5	4	50	1	f
+5	5	50	1	f
+6	1	50	2.5	f
+6	2	50	2.5	f
+6	3	50	2.5	f
+6	4	50	2.5	f
+6	5	50	2.5	f
+7	1	50	2.5	f
+7	2	50	2.5	f
+7	3	50	2.5	f
+7	4	50	2.5	f
+7	5	50	2.5	f
+8	1	50	2	f
+8	2	50	2	f
+8	3	50	2	f
+8	4	50	2	f
+8	5	50	2	f
+9	1	50	2	f
+9	2	50	2	f
+9	3	50	2	f
+9	4	50	2	f
+9	5	50	2	f
+10	1	30	1	f
+10	2	30	1	f
+10	3	30	1	f
+10	4	30	1	f
+10	5	30	1	f
+11	1	50	1	f
+11	2	50	1	f
+11	3	50	1	f
+11	4	50	1	f
+11	5	50	1	f
+12	1	50	2	f
+12	2	50	2	f
+12	3	50	2	f
+12	4	50	2	f
+12	5	50	2	f
+13	1	50	1	f
+13	2	50	1	f
+13	3	50	1	f
+13	4	50	1	f
+13	5	50	1	f
+14	1	50	2	f
+14	2	50	2	f
+14	3	50	2	f
+14	4	50	2	f
+14	5	50	2	f
+15	1	30	1	f
+15	2	30	1	f
+15	3	30	1	f
+15	4	30	1	f
+15	5	30	1	f
+16	1	30	1	f
+16	2	30	1	f
+16	3	30	1	f
+16	4	30	1	f
+16	5	30	1	f
+17	1	30	1	f
+17	2	30	1	f
+17	3	30	1	f
+17	4	30	1	f
+17	5	30	1	f
+18	1	50	1	f
+18	2	50	1	f
+18	3	50	1	f
+18	4	50	1	f
+18	5	50	1	f
+19	1	50	2.5	f
+19	2	50	2.5	f
+19	3	50	2.5	f
+19	4	50	2.5	f
+19	5	50	2.5	f
+20	1	50	3	f
+20	2	50	3	f
+20	3	50	3	f
+20	4	50	3	f
+20	5	50	3	f
+21	1	50	1	f
+21	2	50	1	f
+21	3	50	1	f
+21	4	50	1	f
+21	5	50	1	f
+22	1	50	4	f
+22	2	50	4	f
+22	3	50	4	f
+22	4	50	4	f
+22	5	50	4	f
+23	1	50	2.5	f
+23	2	50	2.5	f
+23	3	50	2.5	f
+23	4	50	2.5	f
+23	5	50	2.5	f
+24	1	50	1	f
+24	2	50	1	f
+24	3	50	1	f
+24	4	50	1	f
+24	5	50	1	f
+25	1	50	2	f
+25	2	50	2	f
+25	3	50	2	f
+25	4	50	2	f
+25	5	50	2	f
+26	1	50	1	f
+26	2	50	1	f
+26	3	50	1	f
+26	4	50	1	f
+26	5	50	1	f
+27	1	50	3	f
+27	2	50	3	f
+27	3	50	3	f
+27	4	50	3	f
+27	5	50	3	f
+28	1	30	1	f
+28	2	30	1	f
+28	3	30	1	f
+28	4	30	1	f
+28	5	30	1	f
+29	1	50	2.5	f
+29	2	50	2.5	f
+29	3	50	2.5	f
+29	4	50	2.5	f
+29	5	50	2.5	f
+30	1	50	4	f
+30	2	50	4	f
+30	3	50	4	f
+30	4	50	4	f
+30	5	50	4	f
+31	1	40	1	f
+31	2	40	1	f
+31	3	40	1	f
+31	4	40	1	f
+31	5	40	1	f
+32	1	50	2	f
+32	2	50	2	f
+32	3	50	2	f
+32	4	50	2	f
+32	5	50	2	f
+33	1	50	2.5	f
+33	2	50	2.5	f
+33	3	50	2.5	f
+33	4	50	2.5	f
+33	5	50	2.5	f
+34	1	30	1	f
+34	2	30	1	f
+34	3	30	1	f
+34	4	30	1	f
+34	5	30	1	f
+35	1	30	1	f
+35	2	30	1	f
+35	3	30	1	f
+35	4	30	1	f
+35	5	30	1	f
+36	1	30	1	f
+36	2	30	1	f
+36	3	30	1	f
+36	4	30	1	f
+36	5	30	1	f
+37	1	40	1	f
+37	2	40	1	f
+37	3	40	1	f
+37	4	40	1	f
+37	5	40	1	f
+38	1	30	1	f
+38	2	30	1	f
+38	3	30	1	f
+38	4	30	1	f
+38	5	30	1	f
+39	1	30	1	f
+39	2	30	1	f
+39	3	30	1	f
+39	4	30	1	f
+39	5	30	1	f
+41	1	30	1	f
+41	2	30	1	f
+41	3	30	1	f
+41	4	30	1	f
+41	5	30	1	f
+42	1	30	1	f
+42	2	30	1	f
+42	3	30	1	f
+42	4	30	1	f
+42	5	30	1	f
+43	1	30	1	f
+43	2	30	1	f
+43	3	30	1	f
+43	4	30	1	f
+43	5	30	1	f
+44	1	30	1	f
+44	2	30	1	f
+44	3	30	1	f
+44	4	30	1	f
+44	5	30	1	f
+45	1	30	1	f
+45	2	30	1	f
+45	3	30	1	f
+45	4	30	1	f
+45	5	30	1	f
+46	1	40	3	f
+46	2	40	3	f
+46	3	40	3	f
+46	4	40	3	f
+46	5	40	3	f
+47	1	30	1	f
+47	2	30	1	f
+47	3	30	1	f
+47	4	30	1	f
+47	5	30	1	f
+48	1	30	1	f
+48	2	30	1	f
+48	3	30	1	f
+48	4	30	1	f
+48	5	30	1	f
+49	1	30	1	f
+49	2	30	1	f
+49	3	30	1	f
+49	4	30	1	f
+49	5	30	1	f
+50	1	30	1	f
+50	2	30	1	f
+50	3	30	1	f
+50	4	30	1	f
+50	5	30	1	f
+51	1	30	1	f
+51	2	30	1	f
+51	3	30	1	f
+51	4	30	1	f
+51	5	30	1	f
+52	1	30	1	f
+52	2	30	1	f
+52	3	30	1	f
+52	4	30	1	f
+52	5	30	1	f
+53	1	30	1	f
+53	2	30	1	f
+53	3	30	1	f
+53	4	30	1	f
+53	5	30	1	f
+54	1	40	1	f
+54	2	40	1	f
+54	3	40	1	f
+54	4	40	1	f
+54	5	40	1	f
+55	1	50	1	f
+55	2	50	1	f
+55	3	50	1	f
+55	4	50	1	f
+55	5	50	1	f
+56	1	4	1	f
+56	2	4	1	f
+56	3	4	1	f
+56	4	4	1	f
+56	5	4	1	f
+57	1	30	1	f
+57	2	30	1	f
+57	3	30	1	f
+57	4	30	1	f
+57	5	30	1	f
+58	1	30	1	f
+58	2	30	1	f
+58	3	30	1	f
+58	4	30	1	f
+58	5	30	1	f
+60	1	40	1	f
+60	2	40	1	f
+60	3	40	1	f
+60	4	40	1	f
+60	5	40	1	f
+61	1	30	1	f
+61	2	30	1	f
+61	3	30	1	f
+61	4	30	1	f
+61	5	30	1	f
+62	1	50	1	f
+62	2	50	1	f
+62	3	50	1	f
+62	4	50	1	f
+62	5	50	1	f
+63	1	50	2.5	f
+63	2	50	2.5	f
+63	3	50	2.5	f
+63	4	50	2.5	f
+63	5	50	2.5	f
+64	1	50	1	f
+64	2	50	1	f
+64	3	50	1	f
+64	4	50	1	f
+64	5	50	1	f
+65	1	50	2.5	f
+65	2	50	2.5	f
+65	3	50	2.5	f
+65	4	50	2.5	f
+65	5	50	2.5	f
+66	1	50	2	f
+66	2	50	2	f
+66	3	50	2	f
+66	4	50	2	f
+66	5	50	2	f
+67	1	50	1	f
+67	2	50	1	f
+67	3	50	1	f
+67	4	50	1	f
+67	5	50	1	f
+68	1	50	2.5	f
+68	2	50	2.5	f
+68	3	50	2.5	f
+68	4	50	2.5	f
+68	5	50	2.5	f
+69	1	40	3	f
+69	2	40	3	f
+69	3	40	3	f
+69	4	40	3	f
+69	5	40	3	f
+70	1	30	1	f
+70	2	30	1	f
+70	3	30	1	f
+70	4	30	1	f
+70	5	30	1	f
+71	1	30	1	f
+71	2	30	1	f
+71	3	30	1	f
+71	4	30	1	f
+71	5	30	1	f
+72	1	30	1	f
+72	2	30	1	f
+72	3	30	1	f
+72	4	30	1	f
+72	5	30	1	f
+73	1	30	1	f
+73	2	30	1	f
+73	3	30	1	f
+73	4	30	1	f
+73	5	30	1	f
+74	1	30	2	f
+74	2	30	2	f
+74	3	30	2	f
+74	4	30	2	f
+74	5	30	2	f
+75	1	30	2	f
+75	2	30	2	f
+75	3	30	2	f
+75	4	30	2	f
+75	5	30	2	f
+76	1	30	2	f
+76	2	30	2	f
+76	3	30	2	f
+76	4	30	2	f
+76	5	30	2	f
+77	1	50	1	f
+77	2	50	1	f
+77	3	50	1	f
+77	4	50	1	f
+77	5	50	1	f
+78	1	50	2	f
+78	2	50	2	f
+78	3	50	2	f
+78	4	50	2	f
+78	5	50	2	f
+79	1	30	2	f
+79	2	30	2	f
+79	3	30	2	f
+79	4	30	2	f
+79	5	30	2	f
+80	1	30	2	f
+80	2	30	2	f
+80	3	30	2	f
+80	4	30	2	f
+80	5	30	2	f
+81	1	30	1	f
+81	2	30	1	f
+81	3	30	1	f
+81	4	30	1	f
+81	5	30	1	f
+82	1	30	1	f
+82	2	30	1	f
+82	3	30	1	f
+82	4	30	1	f
+82	5	30	1	f
+83	1	30	1	f
+83	2	30	1	f
+83	3	30	1	f
+83	4	30	1	f
+83	5	30	1	f
+84	1	30	1	f
+84	2	30	1	f
+84	3	30	1	f
+84	4	30	1	f
+84	5	30	1	f
+85	1	30	1	f
+85	2	30	1	f
+85	3	30	1	f
+85	4	30	1	f
+85	5	30	1	f
+86	1	30	1	f
+86	2	30	1	f
+86	3	30	1	f
+86	4	30	1	f
+86	5	30	1	f
+87	1	30	1	f
+87	2	30	1	f
+87	3	30	1	f
+87	4	30	1	f
+87	5	30	1	f
+88	1	30	1	f
+88	2	30	1	f
+88	3	30	1	f
+88	4	30	1	f
+88	5	30	1	f
+89	1	30	1	f
+89	2	30	1	f
+89	3	30	1	f
+89	4	30	1	f
+89	5	30	1	f
+90	1	30	1	f
+90	2	30	1	f
+90	3	30	1	f
+90	4	30	1	f
+90	5	30	1	f
+91	1	4	1	f
+91	2	4	1	f
+91	3	4	1	f
+91	4	4	1	f
+91	5	4	1	f
+92	1	30	1	f
+92	2	30	1	f
+92	3	30	1	f
+92	4	30	1	f
+92	5	30	1	f
+93	1	30	1	f
+93	2	30	1	f
+93	3	30	1	f
+93	4	30	1	f
+93	5	30	1	f
+94	1	30	1	f
+94	2	30	1	f
+94	3	30	1	f
+94	4	30	1	f
+94	5	30	1	f
+95	1	30	1	f
+95	2	30	1	f
+95	3	30	1	f
+95	4	30	1	f
+95	5	30	1	f
+96	1	30	1	f
+96	2	30	1	f
+96	3	30	1	f
+96	4	30	1	f
+96	5	30	1	f
+97	1	30	1	f
+97	2	30	1	f
+97	3	30	1	f
+97	4	30	1	f
+97	5	30	1	f
+98	1	30	1	f
+98	2	30	1	f
+98	3	30	1	f
+98	4	30	1	f
+98	5	30	1	f
+99	1	30	1	f
+99	2	30	1	f
+99	3	30	1	f
+99	4	30	1	f
+99	5	30	1	f
+100	1	30	1	f
+100	2	30	1	f
+100	3	30	1	f
+100	4	30	1	f
+100	5	30	1	f
+101	1	30	1	f
+101	2	30	1	f
+101	3	30	1	f
+101	4	30	1	f
+101	5	30	1	f
+102	1	30	1	f
+102	2	30	1	f
+102	3	30	1	f
+102	4	30	1	f
+102	5	30	1	f
+103	1	30	1	f
+103	2	30	1	f
+103	3	30	1	f
+103	4	30	1	f
+103	5	30	1	f
+104	1	30	1	f
+104	2	30	1	f
+104	3	30	1	f
+104	4	30	1	f
+104	5	30	1	f
+105	1	30	1	f
+105	2	30	1	f
+105	3	30	1	f
+105	4	30	1	f
+105	5	30	1	f
+106	1	30	1	f
+106	2	30	1	f
+106	3	30	1	f
+106	4	30	1	f
+106	5	30	1	f
+107	1	30	1	f
+107	2	30	1	f
+107	3	30	1	f
+107	4	30	1	f
+107	5	30	1	f
+108	1	30	1	f
+108	2	30	1	f
+108	3	30	1	f
+108	4	30	1	f
+108	5	30	1	f
+109	1	30	1	f
+109	2	30	1	f
+109	3	30	1	f
+109	4	30	1	f
+109	5	30	1	f
+110	1	30	1	f
+110	2	30	1	f
+110	3	30	1	f
+110	4	30	1	f
+110	5	30	1	f
+111	1	30	1	f
+111	2	30	1	f
+111	3	30	1	f
+111	4	30	1	f
+111	5	30	1	f
+112	1	30	1	f
+112	2	30	1	f
+112	3	30	1	f
+112	4	30	1	f
+112	5	30	1	f
+113	1	30	1	f
+113	2	30	1	f
+113	3	30	1	f
+113	4	30	1	f
+113	5	30	1	f
+114	1	50	2	f
+114	2	50	2	f
+114	3	50	2	f
+114	4	50	2	f
+114	5	50	2	f
+115	1	30	1	f
+115	2	30	1	f
+115	3	30	1	f
+115	4	30	1	f
+115	5	30	1	f
+116	1	30	1	f
+116	2	30	1	f
+116	3	30	1	f
+116	4	30	1	f
+116	5	30	1	f
+117	1	30	1	f
+117	2	30	1	f
+117	3	30	1	f
+117	4	30	1	f
+117	5	30	1	f
+118	1	30	1	f
+118	2	30	1	f
+118	3	30	1	f
+118	4	30	1	f
+118	5	30	1	f
+119	1	30	1	f
+119	2	30	1	f
+119	3	30	1	f
+119	4	30	1	f
+119	5	30	1	f
+120	1	30	1	f
+120	2	30	1	f
+120	3	30	1	f
+120	4	30	1	f
+120	5	30	1	f
+121	1	30	1	f
+121	2	30	1	f
+121	3	30	1	f
+121	4	30	1	f
+121	5	30	1	f
+122	1	30	1	f
+122	2	30	1	f
+122	3	30	1	f
+122	4	30	1	f
+122	5	30	1	f
+123	1	30	1	f
+123	2	30	1	f
+123	3	30	1	f
+123	4	30	1	f
+123	5	30	1	f
+124	1	30	1	f
+124	2	30	1	f
+124	3	30	1	f
+124	4	30	1	f
+124	5	30	1	f
+125	1	30	1	f
+125	2	30	1	f
+125	3	30	1	f
+125	4	30	1	f
+125	5	30	1	f
+126	1	50	2.5	f
+126	2	50	2.5	f
+126	3	50	2.5	f
+126	4	50	2.5	f
+126	5	50	2.5	f
+127	1	30	1	f
+127	2	30	1	f
+127	3	30	1	f
+127	4	30	1	f
+127	5	30	1	f
+128	1	30	1	f
+128	2	30	1	f
+128	3	30	1	f
+128	4	30	1	f
+128	5	30	1	f
+129	1	30	1	f
+129	2	30	1	f
+129	3	30	1	f
+129	4	30	1	f
+129	5	30	1	f
+130	1	30	1	f
+130	2	30	1	f
+130	3	30	1	f
+130	4	30	1	f
+130	5	30	1	f
+131	1	30	1	f
+131	2	30	1	f
+131	3	30	1	f
+131	4	30	1	f
+131	5	30	1	f
+132	1	30	1	f
+132	2	30	1	f
+132	3	30	1	f
+132	4	30	1	f
+132	5	30	1	f
+133	1	30	1	f
+133	2	30	1	f
+133	3	30	1	f
+133	4	30	1	f
+133	5	30	1	f
+134	1	50	2	f
+134	2	50	2	f
+134	3	50	2	f
+134	4	50	2	f
+134	5	50	2	f
+135	1	50	2.5	f
+135	2	50	2.5	f
+135	3	50	2.5	f
+135	4	50	2.5	f
+135	5	50	2.5	f
+136	1	50	1	f
+136	2	50	1	f
+136	3	50	1	f
+136	4	50	1	f
+136	5	50	1	f
+137	1	30	1	f
+137	2	30	1	f
+137	3	30	1	f
+137	4	30	1	f
+137	5	30	1	f
+138	1	30	1	f
+138	2	30	1	f
+138	3	30	1	f
+138	4	30	1	f
+138	5	30	1	f
+139	1	30	1	f
+139	2	30	1	f
+139	3	30	1	f
+139	4	30	1	f
+139	5	30	1	f
+140	1	30	1	f
+140	2	30	1	f
+140	3	30	1	f
+140	4	30	1	f
+140	5	30	1	f
+141	1	40	1	f
+141	2	40	1	f
+141	3	40	1	f
+141	4	40	1	f
+141	5	40	1	f
+142	1	30	1	f
+142	2	30	1	f
+142	3	30	1	f
+142	4	30	1	f
+142	5	30	1	f
+143	1	30	1	f
+143	2	30	1	f
+143	3	30	1	f
+143	4	30	1	f
+143	5	30	1	f
+144	1	30	1	f
+144	2	30	1	f
+144	3	30	1	f
+144	4	30	1	f
+144	5	30	1	f
+145	1	30	1	f
+145	2	30	1	f
+145	3	30	1	f
+145	4	30	1	f
+145	5	30	1	f
+146	1	30	1	f
+146	2	30	1	f
+146	3	30	1	f
+146	4	30	1	f
+146	5	30	1	f
+147	1	30	1	f
+147	2	30	1	f
+147	3	30	1	f
+147	4	30	1	f
+147	5	30	1	f
+148	1	50	2	f
+148	2	50	2	f
+148	3	50	2	f
+148	4	50	2	f
+148	5	50	2	f
+149	1	50	2	f
+149	2	50	2	f
+149	3	50	2	f
+149	4	50	2	f
+149	5	50	2	f
+150	1	50	2.5	f
+150	2	50	2.5	f
+150	3	50	2.5	f
+150	4	50	2.5	f
+150	5	50	2.5	f
+151	1	50	2	f
+151	2	50	2	f
+151	3	50	2	f
+151	4	50	2	f
+151	5	50	2	f
+152	1	50	3	f
+152	2	50	3	f
+152	3	50	3	f
+152	4	50	3	f
+152	5	50	3	f
+153	1	50	2	f
+153	2	50	2	f
+153	3	50	2	f
+153	4	50	2	f
+153	5	50	2	f
+154	1	30	1	f
+154	2	30	1	f
+154	3	30	1	f
+154	4	30	1	f
+154	5	30	1	f
+155	1	30	1	f
+155	2	30	1	f
+155	3	30	1	f
+155	4	30	1	f
+155	5	30	1	f
+156	1	30	1	f
+156	2	30	1	f
+156	3	30	1	f
+156	4	30	1	f
+156	5	30	1	f
+157	1	50	1	f
+157	2	50	1	f
+157	3	50	1	f
+157	4	50	1	f
+157	5	50	1	f
+158	1	30	1	f
+158	2	30	1	f
+158	3	30	1	f
+158	4	30	1	f
+158	5	30	1	f
+159	1	4	1	f
+159	2	4	1	f
+159	3	4	1	f
+159	4	4	1	f
+159	5	4	1	f
+160	1	30	1	f
+160	2	30	1	f
+160	3	30	1	f
+160	4	30	1	f
+160	5	30	1	f
+161	1	30	1	f
+161	2	30	1	f
+161	3	30	1	f
+161	4	30	1	f
+161	5	30	1	f
+162	1	30	1	f
+162	2	30	1	f
+162	3	30	1	f
+162	4	30	1	f
+162	5	30	1	f
+163	1	30	1	f
+163	2	30	1	f
+163	3	30	1	f
+163	4	30	1	f
+163	5	30	1	f
+164	1	30	1	f
+164	2	30	1	f
+164	3	30	1	f
+164	4	30	1	f
+164	5	30	1	f
+165	1	50	1	f
+165	2	50	1	f
+165	3	50	1	f
+165	4	50	1	f
+165	5	50	1	f
+166	1	50	2	f
+166	2	50	2	f
+166	3	50	2	f
+166	4	50	2	f
+166	5	50	2	f
+167	1	50	1	f
+167	2	50	1	f
+167	3	50	1	f
+167	4	50	1	f
+167	5	50	1	f
+168	1	50	1	f
+168	2	50	1	f
+168	3	50	1	f
+168	4	50	1	f
+168	5	50	1	f
+169	1	50	1	f
+169	2	50	1	f
+169	3	50	1	f
+169	4	50	1	f
+169	5	50	1	f
+170	1	50	2	f
+170	2	50	2	f
+170	3	50	2	f
+170	4	50	2	f
+170	5	50	2	f
+171	1	50	1	f
+171	2	50	1	f
+171	3	50	1	f
+171	4	50	1	f
+171	5	50	1	f
+172	1	50	1	f
+172	2	50	1	f
+172	3	50	1	f
+172	4	50	1	f
+172	5	50	1	f
+173	1	50	2.5	f
+173	2	50	2.5	f
+173	3	50	2.5	f
+173	4	50	2.5	f
+173	5	50	2.5	f
+174	1	30	1	f
+174	2	30	1	f
+174	3	30	1	f
+174	4	30	1	f
+174	5	30	1	f
+175	1	30	1	f
+175	2	30	1	f
+175	3	30	1	f
+175	4	30	1	f
+175	5	30	1	f
+176	1	30	1	f
+176	2	30	1	f
+176	3	30	1	f
+176	4	30	1	f
+176	5	30	1	f
+177	1	30	1	f
+177	2	30	1	f
+177	3	30	1	f
+177	4	30	1	f
+177	5	30	1	f
+178	1	30	1	f
+178	2	30	1	f
+178	3	30	1	f
+178	4	30	1	f
+178	5	30	1	f
+179	1	30	1	f
+179	2	30	1	f
+179	3	30	1	f
+179	4	30	1	f
+179	5	30	1	f
+180	1	30	1	f
+180	2	30	1	f
+180	3	30	1	f
+180	4	30	1	f
+180	5	30	1	f
+181	1	50	1	f
+181	2	50	1	f
+181	3	50	1	f
+181	4	50	1	f
+181	5	50	1	f
+182	1	40	1	f
+182	2	40	1	f
+182	3	40	1	f
+182	4	40	1	f
+182	5	40	1	f
+183	1	50	2.5	f
+183	2	50	2.5	f
+183	3	50	2.5	f
+183	4	50	2.5	f
+183	5	50	2.5	f
+184	1	30	1	f
+184	2	30	1	f
+184	3	30	1	f
+184	4	30	1	f
+184	5	30	1	f
+185	1	30	1	f
+185	2	30	1	f
+185	3	30	1	f
+185	4	30	1	f
+185	5	30	1	f
+186	1	30	1	f
+186	2	30	1	f
+186	3	30	1	f
+186	4	30	1	f
+186	5	30	1	f
+187	1	50	2	f
+187	2	50	2	f
+187	3	50	2	f
+187	4	50	2	f
+187	5	50	2	f
+188	1	50	1	f
+188	2	50	1	f
+188	3	50	1	f
+188	4	50	1	f
+188	5	50	1	f
+189	1	50	2	f
+189	2	50	2	f
+189	3	50	2	f
+189	4	50	2	f
+189	5	50	2	f
+190	1	50	3	f
+190	2	50	3	f
+190	3	50	3	f
+190	4	50	3	f
+190	5	50	3	f
+191	1	50	1	f
+191	2	50	1	f
+191	3	50	1	f
+191	4	50	1	f
+191	5	50	1	f
+192	1	30	1	f
+192	2	30	1	f
+192	3	30	1	f
+192	4	30	1	f
+192	5	30	1	f
+193	1	30	1	f
+193	2	30	1	f
+193	3	30	1	f
+193	4	30	1	f
+193	5	30	1	f
+194	1	30	1	f
+194	2	30	1	f
+194	3	30	1	f
+194	4	30	1	f
+194	5	30	1	f
+195	1	50	1	f
+195	2	50	1	f
+195	3	50	1	f
+195	4	50	1	f
+195	5	50	1	f
+196	1	30	1	f
+196	2	30	1	f
+196	3	30	1	f
+196	4	30	1	f
+196	5	30	1	f
+197	1	30	1	f
+197	2	30	1	f
+197	3	30	1	f
+197	4	30	1	f
+197	5	30	1	f
+198	1	30	1	f
+198	2	30	1	f
+198	3	30	1	f
+198	4	30	1	f
+198	5	30	1	f
+199	1	30	1	f
+199	2	30	1	f
+199	3	30	1	f
+199	4	30	1	f
+199	5	30	1	f
+200	1	30	1	f
+200	2	30	1	f
+200	3	30	1	f
+200	4	30	1	f
+200	5	30	1	f
+201	1	30	1	f
+201	2	30	1	f
+201	3	30	1	f
+201	4	30	1	f
+201	5	30	1	f
+202	1	4	1	f
+202	2	4	1	f
+202	3	4	1	f
+202	4	4	1	f
+202	5	4	1	f
+203	1	30	1	f
+203	2	30	1	f
+203	3	30	1	f
+203	4	30	1	f
+203	5	30	1	f
+204	1	30	1	f
+204	2	30	1	f
+204	3	30	1	f
+204	4	30	1	f
+204	5	30	1	f
+205	1	30	1	f
+205	2	30	1	f
+205	3	30	1	f
+205	4	30	1	f
+205	5	30	1	f
+206	1	30	1	f
+206	2	30	1	f
+206	3	30	1	f
+206	4	30	1	f
+206	5	30	1	f
+207	1	30	1	f
+207	2	30	1	f
+207	3	30	1	f
+207	4	30	1	f
+207	5	30	1	f
+208	1	30	1	f
+208	2	30	1	f
+208	3	30	1	f
+208	4	30	1	f
+208	5	30	1	f
+209	1	30	1	f
+209	2	30	1	f
+209	3	30	1	f
+209	4	30	1	f
+209	5	30	1	f
+210	1	30	1	f
+210	2	30	1	f
+210	3	30	1	f
+210	4	30	1	f
+210	5	30	1	f
+211	1	30	1	f
+211	2	30	1	f
+211	3	30	1	f
+211	4	30	1	f
+211	5	30	1	f
+212	1	50	2	f
+212	2	50	2	f
+212	3	50	2	f
+212	4	50	2	f
+212	5	50	2	f
+213	1	50	1	f
+213	2	50	1	f
+213	3	50	1	f
+213	4	50	1	f
+213	5	50	1	f
+214	1	50	2.5	f
+214	2	50	2.5	f
+214	3	50	2.5	f
+214	4	50	2.5	f
+214	5	50	2.5	f
+215	1	50	2	f
+215	2	50	2	f
+215	3	50	2	f
+215	4	50	2	f
+215	5	50	2	f
+216	1	50	1	f
+216	2	50	1	f
+216	3	50	1	f
+216	4	50	1	f
+216	5	50	1	f
+217	1	50	1	f
+217	2	50	1	f
+217	3	50	1	f
+217	4	50	1	f
+217	5	50	1	f
+218	1	50	1	f
+218	2	50	1	f
+218	3	50	1	f
+218	4	50	1	f
+218	5	50	1	f
+219	1	50	1	f
+219	2	50	1	f
+219	3	50	1	f
+219	4	50	1	f
+219	5	50	1	f
+220	1	50	2.5	f
+220	2	50	2.5	f
+220	3	50	2.5	f
+220	4	50	2.5	f
+220	5	50	2.5	f
+221	1	50	1	f
+221	2	50	1	f
+221	3	50	1	f
+221	4	50	1	f
+221	5	50	1	f
+222	1	50	1	f
+222	2	50	1	f
+222	3	50	1	f
+222	4	50	1	f
+222	5	50	1	f
+223	1	50	1	f
+223	2	50	1	f
+223	3	50	1	f
+223	4	50	1	f
+223	5	50	1	f
+224	1	50	1	f
+224	2	50	1	f
+224	3	50	1	f
+224	4	50	1	f
+224	5	50	1	f
+225	1	4	1	f
+225	2	4	1	f
+225	3	4	1	f
+225	4	4	1	f
+225	5	4	1	f
+226	1	30	1	f
+226	2	30	1	f
+226	3	30	1	f
+226	4	30	1	f
+226	5	30	1	f
+227	1	4	1	f
+227	2	4	1	f
+227	3	4	1	f
+227	4	4	1	f
+227	5	4	1	f
+228	1	50	2	f
+228	2	50	2	f
+228	3	50	2	f
+228	4	50	2	f
+228	5	50	2	f
+229	1	50	2.5	f
+229	2	50	2.5	f
+229	3	50	2.5	f
+229	4	50	2.5	f
+229	5	50	2.5	f
+230	1	50	2	f
+230	2	50	2	f
+230	3	50	2	f
+230	4	50	2	f
+230	5	50	2	f
+231	1	50	2	f
+231	2	50	2	f
+231	3	50	2	f
+231	4	50	2	f
+231	5	50	2	f
+232	1	50	2.5	f
+232	2	50	2.5	f
+232	3	50	2.5	f
+232	4	50	2.5	f
+232	5	50	2.5	f
+233	1	30	1	f
+233	2	30	1	f
+233	3	30	1	f
+233	4	30	1	f
+233	5	30	1	f
+234	1	30	1	f
+234	2	30	1	f
+234	3	30	1	f
+234	4	30	1	f
+234	5	30	1	f
+235	1	4	1	f
+235	2	4	1	f
+235	3	4	1	f
+235	4	4	1	f
+235	5	4	1	f
+236	1	4	1	f
+236	2	4	1	f
+236	3	4	1	f
+236	4	4	1	f
+236	5	4	1	f
+237	1	4	1	f
+237	2	4	1	f
+237	3	4	1	f
+237	4	4	1	f
+237	5	4	1	f
+238	1	4	1	f
+238	2	4	1	f
+238	3	4	1	f
+238	4	4	1	f
+238	5	4	1	f
+239	1	4	1	f
+239	2	4	1	f
+239	3	4	1	f
+239	4	4	1	f
+239	5	4	1	f
+240	1	50	1	f
+240	2	50	1	f
+240	3	50	1	f
+240	4	50	1	f
+240	5	50	1	f
+241	1	50	1	f
+241	2	50	1	f
+241	3	50	1	f
+241	4	50	1	f
+241	5	50	1	f
+242	1	50	3	f
+242	2	50	3	f
+242	3	50	3	f
+242	4	50	3	f
+242	5	50	3	f
+243	1	50	2	f
+243	2	50	2	f
+243	3	50	2	f
+243	4	50	2	f
+243	5	50	2	f
+244	1	50	2	f
+244	2	50	2	f
+244	3	50	2	f
+244	4	50	2	f
+244	5	50	2	f
+245	1	50	1	f
+245	2	50	1	f
+245	3	50	1	f
+245	4	50	1	f
+245	5	50	1	f
+246	1	50	2	f
+246	2	50	2	f
+246	3	50	2	f
+246	4	50	2	f
+246	5	50	2	f
+247	1	50	3	f
+247	2	50	3	f
+247	3	50	3	f
+247	4	50	3	f
+247	5	50	3	f
+248	1	50	1	f
+248	2	50	1	f
+248	3	50	1	f
+248	4	50	1	f
+248	5	50	1	f
+249	1	50	2.5	f
+249	2	50	2.5	f
+249	3	50	2.5	f
+249	4	50	2.5	f
+249	5	50	2.5	f
+250	1	50	2	f
+250	2	50	2	f
+250	3	50	2	f
+250	4	50	2	f
+250	5	50	2	f
+251	1	5	1	f
+251	2	5	1	f
+251	3	5	1	f
+251	4	5	1	f
+251	5	5	1	f
+252	1	5	1	f
+252	2	5	1	f
+252	3	5	1	f
+252	4	5	1	f
+252	5	5	1	f
+253	1	5	1	f
+253	2	5	1	f
+253	3	5	1	f
+253	4	5	1	f
+253	5	5	1	f
+254	1	5	1	f
+254	2	5	1	f
+254	3	5	1	f
+254	4	5	1	f
+254	5	5	1	f
+255	1	5	1	f
+255	2	5	1	f
+255	3	5	1	f
+255	4	5	1	f
+255	5	5	1	f
+256	1	5	1	f
+256	2	5	1	f
+256	3	5	1	f
+256	4	5	1	f
+256	5	5	1	f
+257	1	5	1	f
+257	2	5	1	f
+257	3	5	1	f
+257	4	5	1	f
+257	5	5	1	f
+258	1	5	1	f
+258	2	5	1	f
+258	3	5	1	f
+258	4	5	1	f
+258	5	5	1	f
+259	1	5	1	f
+259	2	5	1	f
+259	3	5	1	f
+259	4	5	1	f
+259	5	5	1	f
+260	1	5	1	f
+260	2	5	1	f
+260	3	5	1	f
+260	4	5	1	f
+260	5	5	1	f
+261	1	5	1	f
+261	2	5	1	f
+261	3	5	1	f
+261	4	5	1	f
+261	5	5	1	f
+262	1	50	2	f
+262	2	50	2	f
+262	3	50	2	f
+262	4	50	2	f
+262	5	50	2	f
+263	1	50	2	f
+263	2	50	2	f
+263	3	50	2	f
+263	4	50	2	f
+263	5	50	2	f
+264	1	5	1	f
+264	2	5	1	f
+264	3	5	1	f
+264	4	5	1	f
+264	5	5	1	f
+265	1	50	2	f
+265	2	50	2	f
+265	3	50	2	f
+265	4	50	2	f
+265	5	50	2	f
+266	1	50	2	f
+266	2	50	2	f
+266	3	50	2	f
+266	4	50	2	f
+266	5	50	2	f
+267	1	50	2	f
+267	2	50	2	f
+267	3	50	2	f
+267	4	50	2	f
+267	5	50	2	f
+268	1	50	2	f
+268	2	50	2	f
+268	3	50	2	f
+268	4	50	2	f
+268	5	50	2	f
+269	1	40	2	f
+269	2	40	2	f
+269	3	40	2	f
+269	4	40	2	f
+269	5	40	2	f
+270	1	50	1	f
+270	2	50	1	f
+270	3	50	1	f
+270	4	50	1	f
+270	5	50	1	f
+271	1	4	1	f
+271	2	4	1	f
+271	3	4	1	f
+271	4	4	1	f
+271	5	4	1	f
+272	1	50	1	f
+272	2	50	1	f
+272	3	50	1	f
+272	4	50	1	f
+272	5	50	1	f
+273	1	50	1	f
+273	2	50	1	f
+273	3	50	1	f
+273	4	50	1	f
+273	5	50	1	f
+274	1	50	1	f
+274	2	50	1	f
+274	3	50	1	f
+274	4	50	1	f
+274	5	50	1	f
+275	1	50	1	f
+275	2	50	1	f
+275	3	50	1	f
+275	4	50	1	f
+275	5	50	1	f
+276	1	50	2	f
+276	2	50	2	f
+276	3	50	2	f
+276	4	50	2	f
+276	5	50	2	f
+277	1	30	1	f
+277	2	30	1	f
+277	3	30	1	f
+277	4	30	1	f
+277	5	30	1	f
+278	1	30	1	f
+278	2	30	1	f
+278	3	30	1	f
+278	4	30	1	f
+278	5	30	1	f
+279	1	30	1	f
+279	2	30	1	f
+279	3	30	1	f
+279	4	30	1	f
+279	5	30	1	f
+280	1	30	1	f
+280	2	30	1	f
+280	3	30	1	f
+280	4	30	1	f
+280	5	30	1	f
+281	1	30	1	f
+281	2	30	1	f
+281	3	30	1	f
+281	4	30	1	f
+281	5	30	1	f
+282	1	30	1	f
+282	2	30	1	f
+282	3	30	1	f
+282	4	30	1	f
+282	5	30	1	f
+283	1	30	1	f
+283	2	30	1	f
+283	3	30	1	f
+283	4	30	1	f
+283	5	30	1	f
+284	1	50	1	f
+284	2	50	1	f
+284	3	50	1	f
+284	4	50	1	f
+284	5	50	1	f
+285	1	50	2.5	f
+285	2	50	2.5	f
+285	3	50	2.5	f
+285	4	50	2.5	f
+285	5	50	2.5	f
+286	1	50	1	f
+286	2	50	1	f
+286	3	50	1	f
+286	4	50	1	f
+286	5	50	1	f
+287	1	50	1	f
+287	2	50	1	f
+287	3	50	1	f
+287	4	50	1	f
+287	5	50	1	f
+288	1	50	1	f
+288	2	50	1	f
+288	3	50	1	f
+288	4	50	1	f
+288	5	50	1	f
+289	1	50	1	f
+289	2	50	1	f
+289	3	50	1	f
+289	4	50	1	f
+289	5	50	1	f
+290	1	50	1	f
+290	2	50	1	f
+290	3	50	1	f
+290	4	50	1	f
+290	5	50	1	f
+291	1	50	1	f
+291	2	50	1	f
+291	3	50	1	f
+291	4	50	1	f
+291	5	50	1	f
+292	1	50	1	f
+292	2	50	1	f
+292	3	50	1	f
+292	4	50	1	f
+292	5	50	1	f
+293	1	50	1	f
+293	2	50	1	f
+293	3	50	1	f
+293	4	50	1	f
+293	5	50	1	f
+294	1	50	1	f
+294	2	50	1	f
+294	3	50	1	f
+294	4	50	1	f
+294	5	50	1	f
+295	1	30	1	f
+295	2	30	1	f
+295	3	30	1	f
+295	4	30	1	f
+295	5	30	1	f
+296	1	50	1	f
+296	2	50	1	f
+296	3	50	1	f
+296	4	50	1	f
+296	5	50	1	f
+297	1	40	1	f
+297	2	40	1	f
+297	3	40	1	f
+297	4	40	1	f
+297	5	40	1	f
+298	1	30	1	f
+298	2	30	1	f
+298	3	30	1	f
+298	4	30	1	f
+298	5	30	1	f
+299	1	40	2	f
+299	2	40	2	f
+299	3	40	2	f
+299	4	40	2	f
+299	5	40	2	f
+300	1	50	1	f
+300	2	50	1	f
+300	3	50	1	f
+300	4	50	1	f
+300	5	50	1	f
+301	1	30	1	f
+301	2	30	1	f
+301	3	30	1	f
+301	4	30	1	f
+301	5	30	1	f
+302	1	50	1	f
+302	2	50	1	f
+302	3	50	1	f
+302	4	50	1	f
+302	5	50	1	f
+303	1	50	1	f
+303	2	50	1	f
+303	3	50	1	f
+303	4	50	1	f
+303	5	50	1	f
+304	1	50	1	f
+304	2	50	1	f
+304	3	50	1	f
+304	4	50	1	f
+304	5	50	1	f
+305	1	50	1	f
+305	2	50	1	f
+305	3	50	1	f
+305	4	50	1	f
+305	5	50	1	f
+306	1	50	1	f
+306	2	50	1	f
+306	3	50	1	f
+306	4	50	1	f
+306	5	50	1	f
+307	1	50	1	f
+307	2	50	1	f
+307	3	50	1	f
+307	4	50	1	f
+307	5	50	1	f
+308	1	50	1	f
+308	2	50	1	f
+308	3	50	1	f
+308	4	50	1	f
+308	5	50	1	f
+309	1	50	1	f
+309	2	50	1	f
+309	3	50	1	f
+309	4	50	1	f
+309	5	50	1	f
+310	1	50	1	f
+310	2	50	1	f
+310	3	50	1	f
+310	4	50	1	f
+310	5	50	1	f
+311	1	30	2	f
+311	2	30	2	f
+311	3	30	2	f
+311	4	30	2	f
+311	5	30	2	f
+312	1	30	1	f
+312	2	30	1	f
+312	3	30	1	f
+312	4	30	1	f
+312	5	30	1	f
+313	1	50	2	f
+313	2	50	2	f
+313	3	50	2	f
+313	4	50	2	f
+313	5	50	2	f
+314	1	50	1	f
+314	2	50	1	f
+314	3	50	1	f
+314	4	50	1	f
+314	5	50	1	f
+59	1	30	1	f
+59	2	30	1	f
+59	3	30	1	f
+59	4	30	1	f
+59	5	30	1	f
+40	1	30	1	f
+40	2	30	1	f
+40	3	30	1	f
+40	4	30	1	f
+40	5	30	1	f
+\.
+
+
+--
+-- Data for Name: knoten; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.knoten (id, laengengrad, breitengrad) FROM stdin;
+9665706	12.1029368	54.0751387
+321767571	12.1005017	54.077018
+250137189	12.1037463	54.074629
+10011512	12.1187005	54.0764783
+1359747808	12.119661	54.0760754
+3967783745	12.1158687	54.0782252
+73847607	12.1168163	54.0750797
+10011513	12.1220506	54.0753183
+10011514	12.1223791	54.0752328
+257395464	12.1168445	54.072125
+2696344694	12.1198149	54.0760208
+247804976	12.1243075	54.0746844
+247740090	12.1252824	54.0787118
+10712392	12.1141078	54.0765653
+10712398	12.1130134	54.0777776
+74170798	12.1149366	54.0760174
+2486874178	12.1082962	54.0739897
+10712394	12.1190633	54.0742284
+2100157286	12.1125149	54.0731953
+1658759564	12.1197837	54.0748827
+658555668	12.1151752	54.0783031
+249494114	12.1125494	54.0784702
+84497187	12.106296	54.0762496
+10712401	12.1116859	54.0720489
+10712402	12.1117599	54.0722538
+1256628061	12.1164016	54.0718658
+31237041	12.1073394	54.0731511
+10712405	12.1098664	54.0735102
+10712410	12.1158312	54.0755295
+25475250	12.1030201	54.0803041
+31338252	12.103362	54.0804658
+7627004851	12.1026431	54.0797407
+27627986	12.1087984	54.0804268
+27627988	12.1110693	54.0803649
+27627989	12.1089588	54.081033
+246728636	12.1084823	54.0797021
+27628018	12.1111966	54.0809746
+27628012	12.1111907	54.0797711
+29272478	12.1099901	54.0810103
+27627990	12.107933	54.0811546
+27627993	12.1070458	54.0814748
+29272469	12.1066521	54.0799859
+31237039	12.106207	54.0819751
+29272475	12.1086907	54.0820958
+29272485	12.1055978	54.0805726
+29272466	12.108515	54.0795026
+27628013	12.1133101	54.0802898
+27719467	12.1137692	54.0804339
+3147039055	12.1131214	54.0806034
+27719460	12.1120556	54.0820643
+31237030	12.1149796	54.079118
+243689105	12.1140544	54.080537
+28324254	12.1234932	54.0736799
+269978619	12.1261436	54.0731482
+74190354	12.1214096	54.0721958
+28324298	12.125354	54.0788052
+2696108465	12.1249646	54.0788827
+761253990	12.1269489	54.080786
+29272467	12.1072283	54.0794144
+2528028823	12.1027522	54.0791086
+246728635	12.1071898	54.0796112
+29272477	12.1101607	54.0815504
+29272486	12.1037127	54.0796954
+31198364	12.1024313	54.0813608
+5057720699	12.1153567	54.0787079
+268379002	12.1200065	54.0798652
+31237045	12.1071679	54.0729889
+250137191	12.1038919	54.0747526
+74170783	12.1133322	54.0791898
+1131561496	12.1122865	54.0788915
+74190368	12.1244114	54.0717553
+4721819251	12.1057148	54.0759662
+201251898	12.1052865	54.0775964
+103778766	12.1275944	54.08188
+2715807968	12.1276182	54.081991
+343733997	12.1282689	54.081551
+1131561521	12.110864	54.0788704
+258925449	12.1038358	54.0771619
+201251911	12.1030467	54.0766983
+277674651	12.1032772	54.0768208
+250137203	12.1033724	54.076067
+201251917	12.1041387	54.0759991
+243689107	12.1156666	54.0811056
+243689108	12.1156469	54.0812049
+246728722	12.103073	54.0741061
+246728740	12.1034456	54.0743956
+2089344721	12.1009012	54.0760666
+247740093	12.1283647	54.0770701
+247740097	12.1285987	54.0769473
+247805020	12.1266942	54.0741032
+247805024	12.1279068	54.0750663
+1131561396	12.1111509	54.0782297
+250881130	12.1165418	54.0718698
+1530756101	12.1164856	54.0719418
+1256628082	12.1162677	54.0720561
+269978616	12.1275207	54.0725796
+269978621	12.1261578	54.0732619
+277674652	12.1031202	54.0769179
+2094649467	12.1016987	54.0769274
+277674654	12.102797	54.0775375
+1256608721	12.0999767	54.0774467
+343733974	12.1272883	54.0818649
+2708527973	12.1275024	54.0819678
+1769584554	12.1284859	54.0814735
+343733999	12.1274366	54.0814445
+388634928	12.1009931	54.0775772
+509256471	12.1011994	54.0776802
+2094649490	12.1015364	54.0773044
+2488728240	12.1007257	54.0777652
+388634935	12.1019992	54.0774101
+388634940	12.100544	54.0778856
+2271591606	12.1002566	54.0777501
+7955665371	12.1015817	54.0786571
+4163394504	12.1154514	54.0783573
+1654329582	12.1102065	54.0780756
+2710776228	12.0998678	54.0774666
+1256608723	12.0998622	54.0773704
+1256608731	12.0994351	54.0773378
+1359747810	12.1209708	54.0773271
+1359747818	12.1211605	54.0773621
+2696344695	12.1200181	54.0763193
+10580114989	12.1221145	54.0769927
+7627004834	12.1025312	54.0791513
+2696093303	12.1285962	54.0772018
+4163394505	12.1157929	54.0783728
+4163394499	12.1156829	54.0783274
+4163394519	12.1155516	54.0785888
+4163394508	12.1153804	54.0784362
+4163394515	12.1154429	54.0785515
+7042160246	12.1019608	54.0792547
+7925442607	12.1017309	54.0795744
+7627004839	12.1021722	54.0791287
+7627004845	12.1024666	54.0792341
+7627004836	12.1023434	54.0790477
+7946056891	12.102499	54.0790936
+7943127773	12.1022076	54.0790864
+7627004840	12.1021904	54.079205
+7627004844	12.1023452	54.0792596
+7943127774	12.1024811	54.0794116
+7925442608	12.1021377	54.0789322
+\.
+
+
+--
+-- Data for Name: zeitintervall; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.zeitintervall (id, startzeitpunkt, endzeitpunkt) FROM stdin;
+5	19:00:00	23:59:59
+4	15:00:00	18:59:59
+3	10:00:00	14:59:59
+2	06:00:00	09:59:59
+1	00:00:00	05:59:59
+\.
+
+
+--
+-- Name: kante_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.kante_id_seq', 314, true);
+
+
+--
+-- Name: zeitintervall_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.zeitintervall_id_seq', 5, true);
+
+
+--
+-- Name: kante kante_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.kante
+    ADD CONSTRAINT kante_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: knoten knoten_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.knoten
+    ADD CONSTRAINT knoten_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: zeitintervall zeitintervall_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.zeitintervall
+    ADD CONSTRAINT zeitintervall_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: kante kante_knoten1_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.kante
+    ADD CONSTRAINT kante_knoten1_id_fkey FOREIGN KEY (knoten1_id) REFERENCES public.knoten(id);
+
+
+--
+-- Name: kante kante_knoten2_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.kante
+    ADD CONSTRAINT kante_knoten2_id_fkey FOREIGN KEY (knoten2_id) REFERENCES public.knoten(id);
+
+
+--
+-- Name: kanteneigenschaften kanteneigenschaften_kanten_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.kanteneigenschaften
+    ADD CONSTRAINT kanteneigenschaften_kanten_id_fkey FOREIGN KEY (kanten_id) REFERENCES public.kante(id);
+
+
+--
+-- Name: kanteneigenschaften kanteneigenschaften_zeitintervall_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.kanteneigenschaften
+    ADD CONSTRAINT kanteneigenschaften_zeitintervall_id_fkey FOREIGN KEY (zeitintervall_id) REFERENCES public.zeitintervall(id);
+
+
+--
+-- PostgreSQL database dump complete
+--
+
